@@ -1,15 +1,48 @@
+/**
+ * Assistant orchestration layer powered by Cartesia (speech) and Cerebras (LLM).
+ * Google Gemini is only used for the Google Search tool when transcripts require web lookups.
+ */
+
+'use strict';
+
 const { GoogleGenAI } = require('@google/genai');
 const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
+
 const { saveDebugAudio } = require('../audioUtils');
-const { getSystemPrompt } = require('./prompts');
+const { cartesiaSpeechService } = require('./cartesia');
+const { cerebrasService } = require('./cerebras');
 const { composioService } = require('./composio');
+// Removed prompts dependency
+
+// Audio / transcription configuration
+const DEFAULT_SAMPLE_RATE = 24000;
+const ACTIVE_AUDIO_SOURCE = 'system'; // Persist only the faster system capture path
 
 // Conversation tracking variables
 let currentSessionId = null;
-let currentTranscription = '';
 let conversationHistory = [];
-let isInitializingSession = false;
+let sessionState = {
+    customPrompt: '', // User's custom AI instructions
+    googleSearchEnabled: true,
+    geminiApiKey: process.env.GEMINI_API_KEY || null,
+    active: false,
+};
+
+// Audio capture variables
+let systemAudioProc = null;
+
+// Response helpers
+let lastProcessedTranscript = '';
+const recentTranscripts = new Set();
+let ttsQueue = Promise.resolve();
+
+// Google Search state (Gemini used strictly for search tool)
+const searchState = {
+    client: null,
+    apiKey: null,
+    model: null,
+};
 
 function formatSpeakerResults(results) {
     let text = '';
@@ -22,17 +55,15 @@ function formatSpeakerResults(results) {
     return text;
 }
 
-module.exports.formatSpeakerResults = formatSpeakerResults;
+cartesiaSpeechService.on('final-transcript', transcript => {
+    handleCartesiaTranscript(transcript, { isFinal: true }).catch(error => {
+        console.error('Cartesia transcript handler failed:', error);
+    });
+});
 
-// Audio capture variables
-let systemAudioProc = null;
-let messageBuffer = '';
-
-// Reconnection tracking variables
-let reconnectionAttempts = 0;
-let maxReconnectionAttempts = 3;
-let reconnectionDelay = 2000; // 2 seconds between attempts
-let lastSessionParams = null;
+cartesiaSpeechService.on('stt-error', error => {
+    console.error('Cartesia STT error reported:', error?.message || error);
+});
 
 function sendToRenderer(channel, data) {
     const windows = BrowserWindow.getAllWindows();
@@ -41,15 +72,15 @@ function sendToRenderer(channel, data) {
     }
 }
 
-// Conversation management functions
 function initializeNewSession() {
     currentSessionId = Date.now().toString();
-    currentTranscription = '';
     conversationHistory = [];
+    lastProcessedTranscript = '';
+    recentTranscripts.clear();
     console.log('New conversation session started:', currentSessionId);
 }
 
-function saveConversationTurn(transcription, aiResponse) {
+function saveConversationTurn(transcription, aiResponse = '') {
     if (!currentSessionId) {
         initializeNewSession();
     }
@@ -57,13 +88,12 @@ function saveConversationTurn(transcription, aiResponse) {
     const conversationTurn = {
         timestamp: Date.now(),
         transcription: transcription.trim(),
-        ai_response: aiResponse.trim(),
+        ai_response: (aiResponse || '').toString().trim(),
     };
 
     conversationHistory.push(conversationTurn);
     console.log('Saved conversation turn:', conversationTurn);
 
-    // Send to renderer to save in IndexedDB
     sendToRenderer('save-conversation-turn', {
         sessionId: currentSessionId,
         turn: conversationTurn,
@@ -78,131 +108,20 @@ function getCurrentSessionData() {
     };
 }
 
-async function sendReconnectionContext() {
-    if (!global.geminiSessionRef?.current || conversationHistory.length === 0) {
-        return;
-    }
-
-    try {
-        // Gather all transcriptions from the conversation history
-        const transcriptions = conversationHistory
-            .map(turn => turn.transcription)
-            .filter(transcription => transcription && transcription.trim().length > 0);
-
-        if (transcriptions.length === 0) {
-            return;
-        }
-
-        // Create the context message
-        const contextMessage = `Till now all these questions were asked in the interview, answer the last one please:\n\n${transcriptions.join(
-            '\n'
-        )}`;
-
-        console.log('Sending reconnection context with', transcriptions.length, 'previous questions');
-
-        // Send the context message to the new session
-        await global.geminiSessionRef.current.sendRealtimeInput({
-            text: contextMessage,
-        });
-    } catch (error) {
-        console.error('Error sending reconnection context:', error);
-    }
-}
-
-async function getEnabledTools() {
-    const tools = [];
-
-    // Check if Google Search is enabled (default: true)
-    const googleSearchEnabled = await getStoredSetting('googleSearchEnabled', 'true');
-    console.log('Google Search enabled:', googleSearchEnabled);
-
-    if (googleSearchEnabled === 'true') {
-        tools.push({ googleSearch: {} });
-        console.log('Added Google Search tool');
-    } else {
-        console.log('Google Search tool disabled');
-    }
-
-    // Add Composio tools if service is initialized
-    if (composioService.isServiceInitialized()) {
-        try {
-            const composioTools = await composioService.getToolsForGemini('default-user', [
-                'GMAIL_SEND_EMAIL',
-                'GMAIL_GET_EMAILS',
-                'GMAIL_SEARCH_EMAILS',
-                'GMAIL_REPLY_TO_EMAIL'
-            ]);
-            
-            if (composioTools && composioTools.length > 0) {
-                // Clean and convert Composio tools to Gemini format
-                const cleanedTools = composioTools.map(tool => {
-                    // Create a deep copy and clean unsupported properties
-                    const cleanedTool = JSON.parse(JSON.stringify(tool));
-                    
-                    // Clean up parameters to remove unsupported properties
-                    if (cleanedTool.parameters && cleanedTool.parameters.properties) {
-                        const cleanedProperties = {};
-                        for (const [key, value] of Object.entries(cleanedTool.parameters.properties)) {
-                            // Remove unsupported properties for Gemini
-                            const cleanedValue = { ...value };
-                            delete cleanedValue.file_uploadable;
-                            delete cleanedValue.format;
-                            delete cleanedValue.title; // Remove title as it's not needed
-                            delete cleanedValue.examples; // Remove examples as it's not supported by Gemini
-                            
-                            // Keep only essential properties
-                            const essentialProps = ['type', 'description', 'default', 'nullable', 'items'];
-                            const filteredValue = {};
-                            for (const prop of essentialProps) {
-                                if (cleanedValue[prop] !== undefined) {
-                                    filteredValue[prop] = cleanedValue[prop];
-                                }
-                            }
-                            
-                            cleanedProperties[key] = filteredValue;
-                        }
-                        cleanedTool.parameters.properties = cleanedProperties;
-                    }
-                    
-                    return cleanedTool;
-                });
-                
-                // Convert to Gemini format
-                const geminiTools = cleanedTools.map(tool => ({
-                    functionDeclarations: [tool]
-                }));
-                tools.push(...geminiTools);
-                console.log(`Added ${cleanedTools.length} Composio tools`);
-            }
-        } catch (error) {
-            console.error('Failed to load Composio tools:', error);
-            console.log('Continuing without Composio tools...');
-        }
-    }
-
-    return tools;
-}
-
 async function getStoredSetting(key, defaultValue) {
     try {
         const windows = BrowserWindow.getAllWindows();
         if (windows.length > 0) {
-            // Wait a bit for the renderer to be ready
             await new Promise(resolve => setTimeout(resolve, 100));
-
-            // Try to get setting from renderer process localStorage
             const value = await windows[0].webContents.executeJavaScript(`
                 (function() {
                     try {
                         if (typeof localStorage === 'undefined') {
-                            console.log('localStorage not available yet for ${key}');
                             return '${defaultValue}';
                         }
                         const stored = localStorage.getItem('${key}');
-                        console.log('Retrieved setting ${key}:', stored);
                         return stored || '${defaultValue}';
                     } catch (e) {
-                        console.error('Error accessing localStorage for ${key}:', e);
                         return '${defaultValue}';
                     }
                 })()
@@ -212,280 +131,221 @@ async function getStoredSetting(key, defaultValue) {
     } catch (error) {
         console.error('Error getting stored setting for', key, ':', error.message);
     }
-    console.log('Using default value for', key, ':', defaultValue);
     return defaultValue;
 }
 
-async function attemptReconnection() {
-    if (!lastSessionParams || reconnectionAttempts >= maxReconnectionAttempts) {
-        console.log('Max reconnection attempts reached or no session params stored');
-        sendToRenderer('update-status', 'Session closed');
-        return false;
-    }
-
-    reconnectionAttempts++;
-    console.log(`Attempting reconnection ${reconnectionAttempts}/${maxReconnectionAttempts}...`);
-
-    // Wait before attempting reconnection
-    await new Promise(resolve => setTimeout(resolve, reconnectionDelay));
-
-    try {
-        const session = await initializeGeminiSession(
-            lastSessionParams.apiKey,
-            lastSessionParams.customPrompt,
-            lastSessionParams.profile,
-            lastSessionParams.language,
-            true, // isReconnection flag
-            lastSessionParams.composioApiKey
-        );
-
-        if (session && global.geminiSessionRef) {
-            global.geminiSessionRef.current = session;
-            reconnectionAttempts = 0; // Reset counter on successful reconnection
-            console.log('Live session reconnected');
-
-            // Send context message with previous transcriptions
-            await sendReconnectionContext();
-
-            return true;
+function buildCerebrasHistory() {
+    const history = [];
+    for (const turn of conversationHistory) {
+        if (turn.transcription) {
+            history.push({ role: 'user', content: turn.transcription });
         }
-    } catch (error) {
-        console.error(`Reconnection attempt ${reconnectionAttempts} failed:`, error);
+        if (turn.ai_response) {
+            history.push({ role: 'assistant', content: turn.ai_response });
+        }
     }
+    return history;
+}
 
-    // If this attempt failed, try again
-    if (reconnectionAttempts < maxReconnectionAttempts) {
-        return attemptReconnection();
-    } else {
-        console.log('All reconnection attempts failed');
-        sendToRenderer('update-status', 'Session closed');
-        return false;
+function classifyTranscript(text) {
+    const normalized = text.toLowerCase();
+    switch (true) {
+        case /\bsearch\b|\blook up\b|\bgoogle\b|\bfind\b/.test(normalized):
+        case /\bwhat is\b|\bwho is\b|\bwhen is\b|\bwhere is\b|\bhow do\b/.test(normalized):
+        case normalized.endsWith('?'):
+            return 'SEARCH';
+        default:
+            return 'RESPOND';
     }
 }
 
-async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'interview', language = 'en-US', isReconnection = false, composioApiKey = null) {
-    if (isInitializingSession) {
-        console.log('Session initialization already in progress');
-        return false;
+async function ensureSearchModel(apiKey) {
+    const finalKey = apiKey || process.env.GEMINI_API_KEY;
+    if (!finalKey) {
+        console.warn('Google Search requested but no GEMINI_API_KEY is available.');
+        return null;
     }
 
-    isInitializingSession = true;
-    sendToRenderer('session-initializing', true);
-
-    // Use environment variable if apiKey is not provided
-    const finalApiKey = apiKey || process.env.GEMINI_API_KEY;
-
-    // Store session parameters for reconnection (only if not already reconnecting)
-    if (!isReconnection) {
-        lastSessionParams = {
-            apiKey: finalApiKey,
-            customPrompt,
-            profile,
-            language,
-            composioApiKey,
-        };
-        reconnectionAttempts = 0; // Reset counter for new session
+    if (!searchState.client || searchState.apiKey !== finalKey) {
+        searchState.client = new GoogleGenAI({ apiKey: finalKey });
+        searchState.apiKey = finalKey;
+        searchState.model = searchState.client.getGenerativeModel({
+            model: 'gemini-1.5-flash',
+            tools: [{ googleSearch: {} }],
+        });
     }
 
-    const client = new GoogleGenAI({
-        vertexai: false,
-        apiKey: finalApiKey,
-    });
+    return searchState.model;
+}
 
-    // Initialize Composio service if API key is provided
-    if (composioApiKey && !composioService.isServiceInitialized()) {
-        console.log('Initializing Composio service...');
-        await composioService.initialize(composioApiKey, finalApiKey);
+function extractTextFromGeminiResponse(response) {
+    if (!response) {
+        return '';
     }
 
-    // Get enabled tools first to determine Google Search status
-    let enabledTools;
-    try {
-        enabledTools = await getEnabledTools();
-    } catch (error) {
-        console.error('Error getting enabled tools:', error);
-        // Fallback to just Google Search if Composio tools fail
-        enabledTools = [];
-        const googleSearchEnabled = await getStoredSetting('googleSearchEnabled', 'true');
-        if (googleSearchEnabled === 'true') {
-            enabledTools.push({ googleSearch: {} });
+    if (typeof response.text === 'function') {
+        return response.text();
+    }
+
+    if (response.response && typeof response.response.text === 'function') {
+        return response.response.text();
+    }
+
+    if (Array.isArray(response.candidates)) {
+        const parts = [];
+        for (const candidate of response.candidates) {
+            if (!candidate || !Array.isArray(candidate.content?.parts)) {
+                continue;
+            }
+            for (const part of candidate.content.parts) {
+                if (part?.text) {
+                    parts.push(part.text);
+                }
+            }
         }
+        return parts.join('\n');
     }
-    const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
 
-    const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled);
+    return '';
+}
 
-    // Initialize new conversation session (only if not reconnecting)
-    if (!isReconnection) {
-        initializeNewSession();
+async function performGoogleSearch(query) {
+    if (!sessionState.googleSearchEnabled) {
+        return null;
+    }
+
+    const model = await ensureSearchModel(sessionState.geminiApiKey);
+    if (!model) {
+        return null;
     }
 
     try {
-        const session = await client.live.connect({
-            model: 'gemini-live-2.5-flash-preview',
-            callbacks: {
-                onopen: function () {
-                    sendToRenderer('update-status', 'Live session connected');
-                },
-                onmessage: async function (message) {
-                    console.log('----------------', message);
+        const prompt = `Use Google Search to gather the most current, factual highlights for the following request. ` +
+            `Return a concise bulleted summary with sources when possible.\n\nRequest: ${query}`;
 
-                    if (message.serverContent?.inputTranscription?.results) {
-                        currentTranscription += formatSpeakerResults(message.serverContent.inputTranscription.results);
-                    }
-
-                    // Handle AI model response
-                    // Accumulate text chunks silently; only send once on generationComplete
-                    if (message.serverContent?.modelTurn?.parts) {
-                        for (const part of message.serverContent.modelTurn.parts) {
-                            console.log(part);
-                            if (part.text) {
-                                messageBuffer += part.text;
-                            }
-                            
-                            // Handle function calls
-                            if (part.functionCall && composioService.isServiceInitialized()) {
-                                try {
-                                    console.log('🔧 Executing function call:', part.functionCall.name);
-                                    const result = await composioService.executeFunctionCall('default-user', {
-                                        name: part.functionCall.name,
-                                        args: part.functionCall.args || {}
-                                    });
-                                    console.log('✅ Function call result:', result);
-                                    
-                                    // Send function call result to renderer
-                                    sendToRenderer('function-call-result', {
-                                        name: part.functionCall.name,
-                                        result: result
-                                    });
-                                } catch (error) {
-                                    console.error('❌ Function call failed:', error);
-                                    sendToRenderer('function-call-error', {
-                                        name: part.functionCall.name,
-                                        error: error.message
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    if (message.serverContent?.generationComplete) {
-                        sendToRenderer('update-response', messageBuffer);
-
-                        // Save conversation turn when we have both transcription and AI response
-                        if (currentTranscription && messageBuffer) {
-                            saveConversationTurn(currentTranscription, messageBuffer);
-                            currentTranscription = ''; // Reset for next turn
-                        }
-
-                        messageBuffer = '';
-                    }
-
-                    if (message.serverContent?.turnComplete) {
-                        sendToRenderer('update-status', 'Listening...');
-                    }
-                },
-                onerror: function (e) {
-                    console.debug('Error:', e.message);
-
-                    // Check if the error is related to invalid API key
-                    const isApiKeyError =
-                        e.message &&
-                        (e.message.includes('API key not valid') ||
-                            e.message.includes('invalid API key') ||
-                            e.message.includes('authentication failed') ||
-                            e.message.includes('unauthorized'));
-
-                    if (isApiKeyError) {
-                        console.log('Error due to invalid API key - stopping reconnection attempts');
-                        lastSessionParams = null; // Clear session params to prevent reconnection
-                        reconnectionAttempts = maxReconnectionAttempts; // Stop further attempts
-                        sendToRenderer('update-status', 'Error: Invalid API key');
-                        return;
-                    }
-
-                    sendToRenderer('update-status', 'Error: ' + e.message);
-                },
-                onclose: function (e) {
-                    console.debug('Session closed:', e.reason);
-
-                    // Check if the session closed due to invalid API key
-                    const isApiKeyError =
-                        e.reason &&
-                        (e.reason.includes('API key not valid') ||
-                            e.reason.includes('invalid API key') ||
-                            e.reason.includes('authentication failed') ||
-                            e.reason.includes('unauthorized'));
-
-                    if (isApiKeyError) {
-                        console.log('Session closed due to invalid API key - stopping reconnection attempts');
-                        lastSessionParams = null; // Clear session params to prevent reconnection
-                        reconnectionAttempts = maxReconnectionAttempts; // Stop further attempts
-                        sendToRenderer('update-status', 'Session closed: Invalid API key');
-                        return;
-                    }
-
-                    // Attempt automatic reconnection for server-side closures
-                    if (lastSessionParams && reconnectionAttempts < maxReconnectionAttempts) {
-                        console.log('Attempting automatic reconnection...');
-                        attemptReconnection();
-                    } else {
-                        sendToRenderer('update-status', 'Session closed');
-                    }
-                },
-            },
-            config: {
-                responseModalities: ['TEXT'],
-                tools: enabledTools,
-                // Enable speaker diarization
-                inputAudioTranscription: {
-                    enableSpeakerDiarization: true,
-                    minSpeakerCount: 2,
-                    maxSpeakerCount: 2,
-                },
-                contextWindowCompression: { slidingWindow: {} },
-                speechConfig: { languageCode: language },
-                systemInstruction: {
-                    parts: [{ text: systemPrompt }],
-                },
-            },
+        const response = await model.generateContent({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
         });
 
-        isInitializingSession = false;
-        sendToRenderer('session-initializing', false);
-        return session;
+        const summary = extractTextFromGeminiResponse(response);
+        if (summary) {
+            console.log('[Google Search] Summary:', summary);
+            return summary.trim();
+        }
+        } catch (error) {
+        console.error('Google Search failed:', error.message || error);
+    }
+
+    return null;
+}
+
+function queueTtsSynthesis(text) {
+    const trimmed = typeof text === 'string' ? text.trim() : '';
+    if (trimmed.length < 12) {
+        return;
+    }
+
+    ttsQueue = ttsQueue
+        .catch(() => {})
+        .then(async () => {
+            try {
+                const audioPath = await cartesiaSpeechService.synthesizeSpeechToFile(trimmed);
+                if (audioPath) {
+                    // TTS synthesis completed silently
+                }
+            } catch (error) {
+                console.error('Cartesia TTS synthesis failed:', error.message || error);
+            }
+        });
+}
+
+async function respondWithCerebras(transcript, searchSummary = null) {
+    console.log(`[Cerebras] Starting respondWithCerebras for: "${transcript.substring(0, 50)}..."`);
+    
+    const history = buildCerebrasHistory();
+    const systemPrompt = getSystemPrompt('default', sessionState.customPrompt, sessionState.googleSearchEnabled);
+
+    const context = searchSummary
+        ? `${transcript}\n\nWeb search context:\n${searchSummary}`
+        : transcript;
+
+    sendToRenderer('update-status', 'Responding...');
+
+    try {
+        const reply = await cerebrasService.generateReply(context, {
+            history,
+            systemPrompt,
+        });
+
+        if (!reply) {
+            console.log('[Cerebras] No reply generated');
+            sendToRenderer('update-status', 'Listening...');
+            return;
+        }
+
+        console.log(`[Cerebras] Sending response to renderer: "${reply.substring(0, 100)}..."`);
+        sendToRenderer('update-response', reply);
+        saveConversationTurn(transcript, reply);
+        queueTtsSynthesis(reply);
+        sendToRenderer('update-status', 'Listening...');
+        console.log(`[Cerebras] Completed respondWithCerebras successfully`);
     } catch (error) {
-        console.error('Failed to initialize Gemini session:', error);
-        isInitializingSession = false;
-        sendToRenderer('session-initializing', false);
-        return null;
+        console.error('[Cerebras] Error in respondWithCerebras:', error);
+        sendToRenderer('update-status', 'Listening...');
+    }
+}
+
+async function handleCartesiaTranscript(rawTranscript, options = {}) {
+    if (!sessionState.active) {
+        return;
+    }
+
+    const cleaned = typeof rawTranscript === 'string' ? rawTranscript.replace(/\s+/g, ' ').trim() : '';
+    if (!cleaned || cleaned.length < 4) {
+        return;
+    }
+
+    if (cleaned === lastProcessedTranscript) {
+        return;
+    }
+
+    if (recentTranscripts.has(cleaned)) {
+        return;
+    }
+
+    if (recentTranscripts.size > 12) {
+        const iterator = recentTranscripts.values();
+        const first = iterator.next().value;
+        if (first) {
+            recentTranscripts.delete(first);
+        }
+    }
+
+    recentTranscripts.add(cleaned);
+    lastProcessedTranscript = cleaned;
+
+    console.log(`[Cartesia Transcript] ${cleaned}`);
+
+    // Save transcript and generate AI response automatically
+    saveConversationTurn(cleaned, '');
+    
+    // Generate AI response using Cerebras
+    try {
+        await respondWithCerebras(cleaned);
+    } catch (error) {
+        console.error('Error generating Cerebras response:', error);
     }
 }
 
 function killExistingSystemAudioDump() {
     return new Promise(resolve => {
-        console.log('Checking for existing SystemAudioDump processes...');
-
-        // Kill any existing SystemAudioDump processes
         const killProc = spawn('pkill', ['-f', 'SystemAudioDump'], {
             stdio: 'ignore',
         });
 
-        killProc.on('close', code => {
-            if (code === 0) {
-                console.log('Killed existing SystemAudioDump processes');
-            } else {
-                console.log('No existing SystemAudioDump processes found');
-            }
-            resolve();
-        });
+        killProc.on('close', () => resolve());
+        killProc.on('error', () => resolve());
 
-        killProc.on('error', err => {
-            console.log('Error checking for existing processes (this is normal):', err.message);
-            resolve();
-        });
-
-        // Timeout after 2 seconds
         setTimeout(() => {
             killProc.kill();
             resolve();
@@ -493,10 +353,11 @@ function killExistingSystemAudioDump() {
     });
 }
 
-async function startMacOSAudioCapture(geminiSessionRef) {
-    if (process.platform !== 'darwin') return false;
+async function startMacOSAudioCapture() {
+    if (process.platform !== 'darwin') {
+        return false;
+    }
 
-    // Kill any existing SystemAudioDump processes first
     await killExistingSystemAudioDump();
 
     console.log('Starting macOS audio capture with SystemAudioDump...');
@@ -511,24 +372,14 @@ async function startMacOSAudioCapture(geminiSessionRef) {
         systemAudioPath = path.join(__dirname, '../assets', 'SystemAudioDump');
     }
 
-    console.log('SystemAudioDump path:', systemAudioPath);
-
-    // Spawn SystemAudioDump with stealth options
     const spawnOptions = {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: {
             ...process.env,
-            // Set environment variables that might help with stealth
             PROCESS_NAME: 'AudioService',
             APP_NAME: 'System Audio Service',
         },
     };
-
-    // On macOS, apply additional stealth measures
-    if (process.platform === 'darwin') {
-        spawnOptions.detached = false;
-        spawnOptions.windowsHide = false;
-    }
 
     systemAudioProc = spawn(systemAudioPath, [], spawnOptions);
 
@@ -539,11 +390,10 @@ async function startMacOSAudioCapture(geminiSessionRef) {
 
     console.log('SystemAudioDump started with PID:', systemAudioProc.pid);
 
-    const CHUNK_DURATION = 0.1;
-    const SAMPLE_RATE = 24000;
-    const BYTES_PER_SAMPLE = 2;
     const CHANNELS = 2;
-    const CHUNK_SIZE = SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS * CHUNK_DURATION;
+    const BYTES_PER_SAMPLE = 2;
+    const CHUNK_DURATION = 0.1;
+    const CHUNK_SIZE = DEFAULT_SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS * CHUNK_DURATION;
 
     let audioBuffer = Buffer.alloc(0);
 
@@ -556,15 +406,15 @@ async function startMacOSAudioCapture(geminiSessionRef) {
 
             const monoChunk = CHANNELS === 2 ? convertStereoToMono(chunk) : chunk;
             const base64Data = monoChunk.toString('base64');
-            sendAudioToGemini(base64Data, geminiSessionRef);
 
-            if (process.env.DEBUG_AUDIO) {
-                console.log(`Processed audio chunk: ${chunk.length} bytes`);
-                saveDebugAudio(monoChunk, 'system_audio');
+            if (ACTIVE_AUDIO_SOURCE === 'system') {
+                cartesiaSpeechService.enqueueBase64Audio(base64Data);
             }
+
+            // Do not persist audio to disk; keep system lightweight
         }
 
-        const maxBufferSize = SAMPLE_RATE * BYTES_PER_SAMPLE * 1;
+        const maxBufferSize = DEFAULT_SAMPLE_RATE * BYTES_PER_SAMPLE * 1;
         if (audioBuffer.length > maxBufferSize) {
             audioBuffer = audioBuffer.slice(-maxBufferSize);
         }
@@ -605,114 +455,116 @@ function stopMacOSAudioCapture() {
         systemAudioProc.kill('SIGTERM');
         systemAudioProc = null;
     }
-}
 
-async function sendAudioToGemini(base64Data, geminiSessionRef) {
-    if (!geminiSessionRef.current) return;
-
-    try {
-        process.stdout.write('.');
-        await geminiSessionRef.current.sendRealtimeInput({
-            audio: {
-                data: base64Data,
-                mimeType: 'audio/pcm;rate=24000',
-            },
-        });
-    } catch (error) {
-        console.error('Error sending audio to Gemini:', error);
-    }
+    cartesiaSpeechService.stopTranscription({ flush: true }).catch(error => {
+        if (error) {
+            console.error('Error stopping Cartesia STT:', error);
+        }
+    });
 }
 
 function setupGeminiIpcHandlers(geminiSessionRef) {
-    // Store the geminiSessionRef globally for reconnection access
-    global.geminiSessionRef = geminiSessionRef;
+    ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, composioApiKey = null) => {
+        sendToRenderer('session-initializing', true);
 
-    ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, profile = 'interview', language = 'en-US', composioApiKey = null) => {
-        // Use environment variable if apiKey is not provided
-        const finalApiKey = apiKey || process.env.GEMINI_API_KEY;
-        const session = await initializeGeminiSession(finalApiKey, customPrompt, profile, language, false, composioApiKey);
-        if (session) {
-            geminiSessionRef.current = session;
-            return true;
+        sessionState = {
+            ...sessionState,
+            customPrompt: customPrompt || '',
+            geminiApiKey: apiKey || process.env.GEMINI_API_KEY || null,
+            active: true,
+        };
+
+        sessionState.googleSearchEnabled = (await getStoredSetting('googleSearchEnabled', 'true')) === 'true';
+
+        initializeNewSession();
+
+        await cartesiaSpeechService.startTranscription({
+            sampleRate: DEFAULT_SAMPLE_RATE,
+            language: 'en-US',
+            debounceMs: 1200,
+        });
+
+        if (composioApiKey && !composioService.isServiceInitialized()) {
+            console.log('Initializing Composio service...');
+            await composioService.initialize(composioApiKey, sessionState.geminiApiKey);
         }
-        return false;
+
+        geminiSessionRef.current = {
+            close: async () => {
+                await cartesiaSpeechService.stopTranscription({ flush: true });
+                sessionState.active = false;
+            },
+        };
+
+        sendToRenderer('session-initializing', false);
+        sendToRenderer('update-status', 'Listening...');
+
+        return true;
     });
 
-    ipcMain.handle('send-audio-content', async (event, { data, mimeType }) => {
-        if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
-        try {
-            process.stdout.write('.');
-            await geminiSessionRef.current.sendRealtimeInput({
-                audio: { data: data, mimeType: mimeType },
-            });
-            return { success: true };
-        } catch (error) {
-            console.error('Error sending system audio:', error);
-            return { success: false, error: error.message };
+    ipcMain.handle('send-audio-content', async (event, { data }) => {
+        if (!sessionState.active) {
+            return { success: false, error: 'No active session' };
         }
-    });
-
-    // Handle microphone audio on a separate channel
-    ipcMain.handle('send-mic-audio-content', async (event, { data, mimeType }) => {
-        if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
-        try {
-            process.stdout.write(',');
-            await geminiSessionRef.current.sendRealtimeInput({
-                audio: { data: data, mimeType: mimeType },
-            });
-            return { success: true };
-        } catch (error) {
-            console.error('Error sending mic audio:', error);
-            return { success: false, error: error.message };
-        }
-    });
-
-    ipcMain.handle('send-image-content', async (event, { data, debug }) => {
-        if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
 
         try {
-            if (!data || typeof data !== 'string') {
-                console.error('Invalid image data received');
-                return { success: false, error: 'Invalid image data' };
+            if (ACTIVE_AUDIO_SOURCE === 'system' && typeof data === 'string') {
+                cartesiaSpeechService.enqueueBase64Audio(data);
             }
-
-            const buffer = Buffer.from(data, 'base64');
-
-            if (buffer.length < 1000) {
-                console.error(`Image buffer too small: ${buffer.length} bytes`);
-                return { success: false, error: 'Image buffer too small' };
-            }
-
-            process.stdout.write('!');
-            await geminiSessionRef.current.sendRealtimeInput({
-                media: { data: data, mimeType: 'image/jpeg' },
-            });
-
             return { success: true };
         } catch (error) {
-            console.error('Error sending image:', error);
+            console.error('Error handling system audio chunk:', error);
             return { success: false, error: error.message };
         }
+    });
+
+    ipcMain.handle('send-mic-audio-content', async () => {
+        // Mic channel ignored intentionally to avoid duplicate transcripts
+        return { success: true, skipped: true };
+    });
+
+    ipcMain.handle('send-image-content', async () => {
+        return { success: false, error: 'Image input is disabled when Gemini realtime is not in use.' };
     });
 
     ipcMain.handle('send-text-message', async (event, text) => {
-        if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
+        if (!sessionState.active) {
+            return { success: false, error: 'No active session' };
+        }
+
+        if (!text || typeof text !== 'string' || text.trim().length === 0) {
+            return { success: false, error: 'Invalid text message' };
+        }
+
+        // Treat explicit user text as a transcript line unless user requests a response via generate-ai-response
+        await handleCartesiaTranscript(text, { isManual: true });
+        return { success: true };
+    });
+
+    // Optional: generate an AI response on-demand when explicitly requested by the renderer.
+    ipcMain.handle('generate-ai-response', async (event, prompt) => {
+        if (!sessionState.active) {
+            return { success: false, error: 'No active session' };
+        }
+
+        const text = (prompt && typeof prompt === 'string' && prompt.trim().length > 0)
+            ? prompt.trim()
+            : lastProcessedTranscript;
+
+        if (!text) {
+            return { success: false, error: 'No transcript to respond to' };
+        }
 
         try {
-            if (!text || typeof text !== 'string' || text.trim().length === 0) {
-                return { success: false, error: 'Invalid text message' };
-            }
-
-            console.log('Sending text message:', text);
-            await geminiSessionRef.current.sendRealtimeInput({ text: text.trim() });
+            await respondWithCerebras(text);
             return { success: true };
         } catch (error) {
-            console.error('Error sending text:', error);
+            console.error('AI response error:', error);
             return { success: false, error: error.message };
         }
     });
 
-    ipcMain.handle('start-macos-audio', async event => {
+    ipcMain.handle('start-macos-audio', async () => {
         if (process.platform !== 'darwin') {
             return {
                 success: false,
@@ -721,7 +573,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
 
         try {
-            const success = await startMacOSAudioCapture(geminiSessionRef);
+            const success = await startMacOSAudioCapture();
             return { success };
         } catch (error) {
             console.error('Error starting macOS audio capture:', error);
@@ -729,7 +581,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
-    ipcMain.handle('stop-macos-audio', async event => {
+    ipcMain.handle('stop-macos-audio', async () => {
         try {
             stopMacOSAudioCapture();
             return { success: true };
@@ -739,19 +591,14 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
-    ipcMain.handle('close-session', async event => {
+    ipcMain.handle('close-session', async () => {
         try {
             stopMacOSAudioCapture();
-
-            // Clear session params to prevent reconnection when user closes session
-            lastSessionParams = null;
-
-            // Cleanup any pending resources and stop audio/video capture
+            sessionState.active = false;
             if (geminiSessionRef.current) {
                 await geminiSessionRef.current.close();
                 geminiSessionRef.current = null;
             }
-
             return { success: true };
         } catch (error) {
             console.error('Error closing session:', error);
@@ -759,8 +606,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
-    // Conversation history IPC handlers
-    ipcMain.handle('get-current-session', async event => {
+    ipcMain.handle('get-current-session', async () => {
         try {
             return { success: true, data: getCurrentSessionData() };
         } catch (error) {
@@ -769,7 +615,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
-    ipcMain.handle('start-new-session', async event => {
+    ipcMain.handle('start-new-session', async () => {
         try {
             initializeNewSession();
             return { success: true, sessionId: currentSessionId };
@@ -781,9 +627,8 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
     ipcMain.handle('update-google-search-setting', async (event, enabled) => {
         try {
-            console.log('Google Search setting updated to:', enabled);
-            // The setting is already saved in localStorage by the renderer
-            // This is just for logging/confirmation
+            sessionState.googleSearchEnabled = enabled === true || enabled === 'true';
+            console.log('Google Search setting updated to:', sessionState.googleSearchEnabled);
             return { success: true };
         } catch (error) {
             console.error('Error updating Google Search setting:', error);
@@ -791,11 +636,9 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
-    // Composio-specific IPC handlers
     ipcMain.handle('initialize-composio', async (event, composioApiKey, geminiApiKey = null) => {
         try {
-            // Use environment variable if geminiApiKey is not provided
-            const finalGeminiApiKey = geminiApiKey || process.env.GEMINI_API_KEY;
+            const finalGeminiApiKey = geminiApiKey || sessionState.geminiApiKey || process.env.GEMINI_API_KEY;
             const success = await composioService.initialize(composioApiKey, finalGeminiApiKey);
             return { success };
         } catch (error) {
@@ -836,21 +679,18 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
     ipcMain.handle('analyze-email-intent', async (event, prompt) => {
         try {
-            const { GoogleGenAI } = require('@google/genai');
-            const client = new GoogleGenAI({
-                vertexai: false,
-                apiKey: process.env.GEMINI_API_KEY,
+            console.log(`[Email Analysis] Checking email intent for: "${prompt.substring(0, 50)}..."`);
+            const analysisPrompt = `Reply strictly with YES or NO. Does the following email request require sending or drafting an email?\n\n${prompt}`;
+            const response = await cerebrasService.generateReply(analysisPrompt, {
+                temperature: 0,
+                maxTokens: 5,
+                systemPrompt: 'You are an intent classifier that only answers YES or NO.',
             });
 
-            const response = await client.models.generateContent({
-                model: 'gemini-2.0-flash-001',
-                contents: prompt,
-            });
-
-            return { 
-                success: true, 
-                result: response.text || 'NO' 
-            };
+            const normalized = (response || '').trim().toUpperCase();
+            const result = normalized.startsWith('Y') ? 'YES' : 'NO';
+            console.log(`[Email Analysis] Result: ${result} for "${prompt.substring(0, 50)}..."`);
+            return { success: true, result };
         } catch (error) {
             console.error('Error analyzing email intent:', error);
             return { success: false, error: error.message };
@@ -859,20 +699,11 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 }
 
 module.exports = {
-    initializeGeminiSession,
-    getEnabledTools,
-    getStoredSetting,
+    formatSpeakerResults,
     sendToRenderer,
+    stopMacOSAudioCapture,
+    setupGeminiIpcHandlers,
     initializeNewSession,
     saveConversationTurn,
     getCurrentSessionData,
-    sendReconnectionContext,
-    killExistingSystemAudioDump,
-    startMacOSAudioCapture,
-    convertStereoToMono,
-    stopMacOSAudioCapture,
-    sendAudioToGemini,
-    setupGeminiIpcHandlers,
-    attemptReconnection,
-    formatSpeakerResults,
 };

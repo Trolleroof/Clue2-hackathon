@@ -470,22 +470,66 @@ export class AssistantView extends LitElement {
                 });
                 node.parentNode.replaceChild(frag, node);
             } else if (node.nodeType === Node.ELEMENT_NODE && !tagsToSkip.includes(node.tagName)) {
-                // Preserve formatting tags like strong, b, em, i, etc.
-                if (['STRONG', 'B', 'EM', 'I', 'CODE', 'MARK'].includes(node.tagName)) {
-                    const words = node.textContent.split(/(\s+)/);
+                if (['STRONG', 'B', 'EM', 'I', 'MARK'].includes(node.tagName)) {
+                    const textContent = node.textContent;
+                    const words = textContent.split(/(\s+)/);
                     const frag = document.createDocumentFragment();
+                    
+                    // Create a new element with the same tag name
+                    const newElement = document.createElement(node.tagName.toLowerCase());
                     words.forEach(word => {
                         if (word.trim()) {
                             const span = document.createElement('span');
                             span.setAttribute('data-word', '');
-                            span.innerHTML = `<${node.tagName.toLowerCase()}>${word}</${node.tagName.toLowerCase()}>`;
-                            frag.appendChild(span);
+                            span.textContent = word;
+                            newElement.appendChild(span);
                         } else {
-                            frag.appendChild(document.createTextNode(word));
+                            newElement.appendChild(document.createTextNode(word));
                         }
                     });
+                    
+                    // Copy any attributes from the original node
+                    Array.from(node.attributes).forEach(attr => {
+                        newElement.setAttribute(attr.name, attr.value);
+                    });
+                    
+                    frag.appendChild(newElement);
+                    node.parentNode.replaceChild(frag, node);
+                } else if (node.tagName === 'CODE') {
+                    // Handle code elements differently - wrap the entire code block
+                    const codeSpan = document.createElement('span');
+                    codeSpan.setAttribute('data-word', '');
+                    codeSpan.innerHTML = node.outerHTML;
+                    node.parentNode.replaceChild(codeSpan, node);
+                } else if (node.tagName === 'LI') {
+                    // Handle bullet points - extract text and wrap words, preserving the list structure
+                    const textContent = node.textContent;
+                    const words = textContent.split(/(\s+)/);
+                    const frag = document.createDocumentFragment();
+                    
+                    // Create new LI element
+                    const newLi = document.createElement('li');
+                    
+                    // Copy any attributes from the original node
+                    Array.from(node.attributes).forEach(attr => {
+                        newLi.setAttribute(attr.name, attr.value);
+                    });
+                    
+                    words.forEach(word => {
+                        if (word.trim()) {
+                            const span = document.createElement('span');
+                            span.setAttribute('data-word', '');
+                            span.textContent = word;
+                            newLi.appendChild(span);
+                        } else {
+                            newLi.appendChild(document.createTextNode(word));
+                        }
+                    });
+                    
+                    frag.appendChild(newLi);
                     node.parentNode.replaceChild(frag, node);
                 } else {
+                    // For other elements, recursively process child nodes
                     Array.from(node.childNodes).forEach(wrap);
                 }
             }

@@ -25,6 +25,8 @@
     },
     "license": "GPL-3.0",
     "dependencies": {
+        "@cartesia/cartesia-js": "^2.2.5",
+        "@cerebras/cerebras_cloud_sdk": "^1.50.0",
         "@composio/core": "^0.1.53",
         "@composio/google": "^0.1.53",
         "@google/genai": "^1.2.0",

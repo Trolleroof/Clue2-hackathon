@@ -378,7 +378,7 @@ export class HistoryView extends LitElement {
         }
 
         const firstTurn = session.conversationHistory[0];
-        const preview = firstTurn.transcription || firstTurn.ai_response || 'Empty conversation';
+        const preview = firstTurn.transcription || 'Empty conversation';
         return preview.length > 100 ? preview.substring(0, 100) + '...' : preview;
     }
 

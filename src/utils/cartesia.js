@@ -61,12 +61,16 @@ class CartesiaSpeechService extends EventEmitter {
     }
 
     async startTranscription(options = {}) {
+        console.log(`🎙️ [Cartesia] Starting transcription with options:`, options);
+        
         if (this.sttWs) {
+            console.log(`⚠️ [Cartesia] WebSocket already exists, skipping initialization`);
             return true;
         }
 
         const ready = await this.ensureClient();
         if (!ready) {
+            console.log(`❌ [Cartesia] Client not ready, cannot start transcription`);
             return false;
         }
 
@@ -83,6 +87,8 @@ class CartesiaSpeechService extends EventEmitter {
         this.debounceMs = debounceMs;
         this.resetBatch();
 
+        console.log(`🔧 [Cartesia] Config: sampleRate=${this.sampleRate}, language=${this.language}, debounceMs=${this.debounceMs}`);
+
         try {
             this.sttWs = this.client.stt.websocket({
                 model: DEFAULT_STT_MODEL,
@@ -93,17 +99,17 @@ class CartesiaSpeechService extends EventEmitter {
                 maxSilenceDurationSecs,
             });
 
-            this.sttWs.onMessage(message => {
-                try {
-                    this.handleSttMessage(message);
-                } catch (err) {
-                    console.error('[Cartesia] Error handling STT message:', err);
-                }
-            });
+        this.sttWs.onMessage(message => {
+            try {
+                this.handleSttMessage(message);
+            } catch (err) {
+                console.error('[Cartesia] Error handling STT message:', err);
+            }
+        });
 
             this.pendingSend = Promise.resolve();
             this.isStreaming = true;
-            // STT streaming started silently
+            console.log(`✅ [Cartesia] STT WebSocket initialized successfully`);
             return true;
         } catch (error) {
             console.error('[Cartesia] Failed to start STT websocket:', error.message || error);
@@ -217,7 +223,9 @@ class CartesiaSpeechService extends EventEmitter {
         const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
 
         this.pendingSend = this.pendingSend
-            .then(() => this.sttWs.send(arrayBuffer))
+            .then(() => {
+                return this.sttWs.send(arrayBuffer);
+            })
             .catch(error => {
                 console.error('[Cartesia] Error sending audio chunk:', error);
             });

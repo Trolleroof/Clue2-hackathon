@@ -856,6 +856,23 @@ export class CustomizeView extends LitElement {
         root.style.setProperty('--response-font-size', `${this.fontSize}px`);
     }
 
+    async handleAutoResponseChange(e) {
+        const autoResponseEnabled = e.target.checked;
+        localStorage.setItem('autoResponseEnabled', autoResponseEnabled.toString());
+        
+        // Notify main process if available
+        if (window.require) {
+            try {
+                const { ipcRenderer } = window.require('electron');
+                await ipcRenderer.invoke('update-auto-response-setting', autoResponseEnabled);
+            } catch (error) {
+                console.error('Failed to notify main process:', error);
+            }
+        }
+        
+        this.requestUpdate();
+    }
+
     render() {
         const profiles = this.getProfiles();
         const languages = this.getLanguages();
@@ -873,41 +890,22 @@ export class CustomizeView extends LitElement {
 
                     <div class="form-grid">
                         <div class="form-row">
-                            <div class="form-group">
-                                <label class="form-label">
-                                    Profile Type
-                                    <span class="current-selection">${currentProfile?.name || 'Unknown'}</span>
-                                </label>
-                                <select class="form-control" .value=${this.selectedProfile} @change=${this.handleProfileSelect}>
-                                    ${profiles.map(
-                                        profile => html`
-                                            <option value=${profile.value} ?selected=${this.selectedProfile === profile.value}>
-                                                ${profile.name}
-                                            </option>
-                                        `
-                                    )}
-                                </select>
-                            </div>
                         </div>
 
                         <div class="form-group full-width">
                             <label class="form-label">Custom AI Instructions</label>
                             <textarea
                                 class="form-control"
-                                placeholder="Add specific instructions for how you want the AI to behave during ${
-                                    profileNames[this.selectedProfile] || 'this interaction'
-                                }..."
-                                .value=${localStorage.getItem('customPrompt') || ''}
-                                rows="4"
+                                placeholder="Add your own instructions that you would like Clue2 to follow."
                                 @input=${this.handleCustomPromptInput}
                             ></textarea>
                             <div class="form-description">
                                 Personalize the AI's behavior with specific instructions that will be added to the
                                 ${profileNames[this.selectedProfile] || 'selected profile'} base prompts
+                            </div>
+                        </div>
+                    </div>
                 </div>
-                </div>
-            </div>
-        </div>
 
                 <!-- Audio & Microphone Section -->
                 <div class="settings-section">
@@ -925,6 +923,21 @@ export class CustomizeView extends LitElement {
                             <div class="form-description">
                                 Choose which audio sources to capture for the AI.
                             </div>
+                        </div>
+                        
+                        <div class="checkbox-group">
+                            <input
+                                type="checkbox"
+                                class="checkbox-input"
+                                id="auto-response-enabled"
+                                .checked=${localStorage.getItem('autoResponseEnabled') === 'true'}
+                                @change=${this.handleAutoResponseChange}
+                            />
+                            <label for="auto-response-enabled" class="checkbox-label">Enable Automatic AI Responses</label>
+                        </div>
+                        <div class="form-description" style="margin-left: 24px; margin-top: -8px;">
+                            When enabled, the AI will automatically respond to detected speech. When disabled, the AI will only respond to manual text messages you send.
+                            <br /><strong>Default:</strong> Disabled - You control when the AI responds
                         </div>
                     </div>
                 </div>
@@ -1198,30 +1211,7 @@ export class CustomizeView extends LitElement {
                     💡 Settings are automatically saved as you change them. Changes will take effect immediately or on the next session start.
                 </div>
 
-                <!-- Advanced Mode Section (Danger Zone) -->
-                <div class="settings-section" style="border-color: var(--danger-border, rgba(239, 68, 68, 0.3)); background: var(--danger-background, rgba(239, 68, 68, 0.05));">
-                    <div class="section-title" style="color: var(--danger-color, #ef4444);">
-                        <span>⚠️ Advanced Mode</span>
-                    </div>
-
-                    <div class="form-grid">
-                        <div class="checkbox-group">
-                                <input
-                                    type="checkbox"
-                                    class="checkbox-input"
-                                    id="advanced-mode"
-                                    .checked=${this.advancedMode}
-                                    @change=${this.handleAdvancedModeChange}
-                                />
-                                <label for="advanced-mode" class="checkbox-label"> Enable Advanced Mode </label>
-                            </div>
-                            <div class="form-description" style="margin-left: 24px; margin-top: -8px;">
-                                Unlock experimental features, developer tools, and advanced configuration options
-                                <br /><strong>Note:</strong> Advanced mode adds a new icon to the main navigation bar
-                            </div>
-                        </div>
-                    </div>
-                </div>
+               
             </div>
         `;
     }

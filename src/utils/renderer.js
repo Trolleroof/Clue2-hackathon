@@ -235,6 +235,8 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
                         video: false,
                     });
                     console.log('macOS microphone capture started');
+                    console.log(`[Audio Mode] Using microphone audio - mode: ${audioMode}`);
+                    console.log(`[Mic Stream] Sample rate: ${SAMPLE_RATE}, Buffer size: ${BUFFER_SIZE}, Chunk duration: ${AUDIO_CHUNK_DURATION}s`);
                     setupLinuxMicProcessing(micStream);
                 } catch (micError) {
                     console.warn('Failed to get microphone access on macOS:', micError);
@@ -377,7 +379,9 @@ function setupLinuxMicProcessing(micStream) {
 
     let audioBuffer = [];
     const samplesPerChunk = SAMPLE_RATE * AUDIO_CHUNK_DURATION;
-
+    
+    let lastLogTime = 0;
+    const LOG_INTERVAL = 1400; 
     micProcessor.onaudioprocess = async e => {
         const inputData = e.inputBuffer.getChannelData(0);
         audioBuffer.push(...inputData);
@@ -387,6 +391,16 @@ function setupLinuxMicProcessing(micStream) {
             const chunk = audioBuffer.splice(0, samplesPerChunk);
             const pcmData16 = convertFloat32ToInt16(chunk);
             const base64Data = arrayBufferToBase64(pcmData16.buffer);
+
+            // Throttled microphone logging (once per second)
+            const now = Date.now();
+            if (now - lastLogTime >= LOG_INTERVAL) {
+                const maxAmplitude = Math.max(...chunk.map(Math.abs));
+                const avgAmplitude = chunk.reduce((sum, val) => sum + Math.abs(val), 0) / chunk.length;
+                const audioLevel = maxAmplitude > 0.01 ? 'SOUND DETECTED' : 'SILENCE';
+                console.log(`[Mic Audio Input] ${audioLevel}: max=${maxAmplitude.toFixed(6)}, avg=${avgAmplitude.toFixed(6)}, samples=${chunk.length}`);
+                lastLogTime = now;
+            }
 
             await ipcRenderer.invoke('send-mic-audio-content', {
                 data: base64Data,

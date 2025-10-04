@@ -101,6 +101,8 @@ export class AppHeader extends LitElement {
         isClickThrough: { type: Boolean, reflect: true },
         advancedMode: { type: Boolean },
         onAdvancedClick: { type: Function },
+        onConnectionsClick: { type: Function },
+        onHomeClick: { type: Function },
     };
 
     constructor() {
@@ -117,6 +119,8 @@ export class AppHeader extends LitElement {
         this.isClickThrough = false;
         this.advancedMode = false;
         this.onAdvancedClick = () => {};
+        this.onConnectionsClick = () => {};
+        this.onHomeClick = () => {};
         this._timerInterval = null;
     }
 
@@ -180,6 +184,7 @@ export class AppHeader extends LitElement {
             help: 'Help & Shortcuts',
             history: 'Conversation History',
             advanced: 'Advanced Tools',
+            connections: 'Connections',
             assistant: 'Clue2',
         };
         return titles[this.currentView] || 'Clue2';
@@ -194,7 +199,7 @@ export class AppHeader extends LitElement {
     }
 
     isNavigationView() {
-        const navigationViews = ['customize', 'help', 'history', 'advanced'];
+        const navigationViews = ['customize', 'help', 'history', 'advanced', 'connections'];
         return navigationViews.includes(this.currentView);
     }
 
@@ -211,8 +216,34 @@ export class AppHeader extends LitElement {
                               <span>${this.statusText}</span>
                           `
                         : ''}
-                    ${this.currentView === 'main'
+                    ${this.isNavigationView() || this.currentView === 'main'
                         ? html`
+                              <button class="icon-button" @click=${this.onHomeClick} title="Home">
+                                  <?xml version="1.0" encoding="UTF-8"?><svg
+                                      width="24px"
+                                      height="24px"
+                                      stroke-width="1.7"
+                                      viewBox="0 0 24 24"
+                                      fill="none"
+                                      xmlns="http://www.w3.org/2000/svg"
+                                      color="currentColor"
+                                  >
+                                      <path
+                                          d="M3 9L12 2L21 9V20C21 20.5304 20.7893 21.0391 20.4142 21.4142C20.0391 21.7893 19.5304 22 19 22H5C4.46957 22 3.96086 21.7893 3.58579 21.4142C3.21071 21.0391 3 20.5304 3 20V9Z"
+                                          stroke="currentColor"
+                                          stroke-width="1.7"
+                                          stroke-linecap="round"
+                                          stroke-linejoin="round"
+                                      ></path>
+                                      <path
+                                          d="M9 22V12H15V22"
+                                          stroke="currentColor"
+                                          stroke-width="1.7"
+                                          stroke-linecap="round"
+                                          stroke-linejoin="round"
+                                      ></path>
+                                  </svg>
+                              </button>
                               <button class="icon-button" @click=${this.onHistoryClick}>
                                   <?xml version="1.0" encoding="UTF-8"?><svg
                                       width="24px"
@@ -250,6 +281,51 @@ export class AppHeader extends LitElement {
                                           stroke-width="1.7"
                                           stroke-linecap="round"
                                           stroke-linejoin="round"
+                                      ></path>
+                                  </svg>
+                              </button>
+                              <button class="icon-button" @click=${this.onConnectionsClick} title="Connections">
+                                  <?xml version="1.0" encoding="UTF-8"?><svg
+                                      width="24px"
+                                      height="24px"
+                                      stroke-width="1.7"
+                                      viewBox="0 0 24 24"
+                                      fill="none"
+                                      xmlns="http://www.w3.org/2000/svg"
+                                      color="currentColor"
+                                  >
+                                      <path
+                                          d="M16 4H18C20.2091 4 22 5.79086 22 8V16C22 18.2091 20.2091 20 18 20H16"
+                                          stroke="currentColor"
+                                          stroke-width="1.7"
+                                          stroke-linecap="round"
+                                          stroke-linejoin="round"
+                                      ></path>
+                                      <path
+                                          d="M8 4H6C3.79086 4 2 5.79086 2 8V16C2 18.2091 3.79086 20 6 20H8"
+                                          stroke="currentColor"
+                                          stroke-width="1.7"
+                                          stroke-linecap="round"
+                                          stroke-linejoin="round"
+                                      ></path>
+                                      <path
+                                          d="M8 8H16V16H8V8Z"
+                                          stroke="currentColor"
+                                          stroke-width="1.7"
+                                          stroke-linecap="round"
+                                          stroke-linejoin="round"
+                                      ></path>
+                                      <path
+                                          d="M12 8V16"
+                                          stroke="currentColor"
+                                          stroke-width="1.7"
+                                          stroke-linecap="round"
+                                      ></path>
+                                      <path
+                                          d="M8 12H16"
+                                          stroke="currentColor"
+                                          stroke-width="1.7"
+                                          stroke-linecap="round"
                                       ></path>
                                   </svg>
                               </button>

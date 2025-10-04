@@ -7,6 +7,7 @@ import { HistoryView } from '../views/HistoryView.js';
 import { AssistantView } from '../views/AssistantView.js';
 import { OnboardingView } from '../views/OnboardingView.js';
 import { AdvancedView } from '../views/AdvancedView.js';
+import { ConnectionsView } from '../views/ConnectionsView.js';
 
 export class CheatingDaddyApp extends LitElement {
     static styles = css`
@@ -107,6 +108,8 @@ export class CheatingDaddyApp extends LitElement {
         responses: { type: Array },
         currentResponseIndex: { type: Number },
         messages: { type: Array },
+        chatMessages: { type: Array },
+        transcriptMessages: { type: Array },
         selectedScreenshotInterval: { type: String },
         selectedImageQuality: { type: String },
         layoutMode: { type: String },
@@ -133,6 +136,8 @@ export class CheatingDaddyApp extends LitElement {
         this.responses = [];
         this.currentResponseIndex = -1;
         this.messages = [];
+        this.chatMessages = [];
+        this.transcriptMessages = [];
         this._viewInstances = new Map();
         this._isClickThrough = false;
         this._awaitingNewResponse = false;
@@ -161,6 +166,9 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.on('click-through-toggled', (_, isEnabled) => {
                 this._isClickThrough = isEnabled;
             });
+            ipcRenderer.on('transcript-captured', (_, data) => {
+                this.addTranscriptMessage(data);
+            });
         }
     }
 
@@ -172,6 +180,7 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.removeAllListeners('update-response-streaming');
             ipcRenderer.removeAllListeners('update-status');
             ipcRenderer.removeAllListeners('click-through-toggled');
+            ipcRenderer.removeAllListeners('transcript-captured');
         }
     }
 
@@ -185,8 +194,17 @@ export class CheatingDaddyApp extends LitElement {
         }
     }
 
-    setResponse(response) {
-        let responseText = typeof response === 'string' ? response : String(response ?? '');
+    setResponse(response, source = 'transcript') {
+        let responseData = response;
+        let responseText;
+        
+        // Handle new response format with source information
+        if (typeof response === 'object' && response.reply && response.source) {
+            responseText = response.reply;
+            source = response.source;
+        } else {
+            responseText = typeof response === 'string' ? response : String(response ?? '');
+        }
         
         // Remove leading and trailing quotes if they wrap the entire response
         responseText = responseText.replace(/^["'](.*)["']$/s, '$1');
@@ -200,32 +218,61 @@ export class CheatingDaddyApp extends LitElement {
                 responseText.toLowerCase().includes('go on') ||
                 responseText.toLowerCase().includes('continue'));
 
+        const assistantMessage = {
+            id: `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            role: 'assistant',
+            content: responseText,
+            timestamp: Date.now(),
+            type: source, // Mark the source: 'chat' or 'transcript'
+        };
+
         // If we're awaiting a new response, always create a new message
         if (this._awaitingNewResponse) {
             this.responses = [...this.responses, responseText];
             this.currentResponseIndex = this.responses.length - 1;
             this._awaitingNewResponse = false;
             this._currentResponseIsComplete = false;
-            const assistantMessage = {
-                id: `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                role: 'assistant',
-                content: responseText,
-                timestamp: Date.now(),
-            };
+            
+            // Add to appropriate array based on source
+            if (source === 'chat') {
+                this.chatMessages = [...this.chatMessages, assistantMessage];
+            } else {
+                this.transcriptMessages = [...this.transcriptMessages, assistantMessage];
+            }
+            
+            // Keep backward compatibility
             this.messages = [...this.messages, assistantMessage];
             console.log('[setResponse] Created new response:', responseText);
         } else if (this.responses.length > 0 && !this._currentResponseIsComplete) {
             // Update the last response (streaming behavior)
             // Only update if the current response is not marked as complete
             this.responses = [...this.responses.slice(0, this.responses.length - 1), responseText];
-            const lastMessage = this.messages[this.messages.length - 1];
-            if (lastMessage && lastMessage.role === 'assistant') {
+            
+            // Update in both the main messages array and the appropriate source array
+            const mainLastMessage = this.messages[this.messages.length - 1];
+            if (mainLastMessage && mainLastMessage.role === 'assistant') {
                 const updatedAssistant = {
-                    ...lastMessage,
+                    ...mainLastMessage,
                     content: responseText,
                     timestamp: Date.now(),
                 };
                 this.messages = [...this.messages.slice(0, this.messages.length - 1), updatedAssistant];
+                
+                // Update in the specific source array
+                const sourceArray = source === 'chat' ? this.chatMessages : this.transcriptMessages;
+                const sourceLastMessage = sourceArray[sourceArray.length - 1];
+                if (sourceLastMessage && sourceLastMessage.role === 'assistant') {
+                    const updatedSourceAssistant = {
+                        ...sourceLastMessage,
+                        content: responseText,
+                        timestamp: Date.now(),
+                    };
+                    if (source === 'chat') {
+                        this.chatMessages = [...this.chatMessages.slice(0, this.chatMessages.length - 1), updatedSourceAssistant];
+                    } else {
+                        this.transcriptMessages = [...this.transcriptMessages.slice(0, this.transcriptMessages.length - 1), updatedSourceAssistant];
+                    }
+                }
             }
             console.log('[setResponse] Updated streaming response:', responseText);
         } else {
@@ -233,12 +280,15 @@ export class CheatingDaddyApp extends LitElement {
             this.responses = [...this.responses, responseText];
             this.currentResponseIndex = this.responses.length - 1;
             this._currentResponseIsComplete = false;
-            const assistantMessage = {
-                id: `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                role: 'assistant',
-                content: responseText,
-                timestamp: Date.now(),
-            };
+            
+            // Add to appropriate array based on source
+            if (source === 'chat') {
+                this.chatMessages = [...this.chatMessages, assistantMessage];
+            } else {
+                this.transcriptMessages = [...this.transcriptMessages, assistantMessage];
+            }
+            
+            // Keep backward compatibility
             this.messages = [...this.messages, assistantMessage];
             console.log('[setResponse] Added new response (complete or filler):', responseText);
         }
@@ -284,6 +334,26 @@ export class CheatingDaddyApp extends LitElement {
         this.requestUpdate();
     }
 
+    addTranscriptMessage(data) {
+        const transcriptMessage = {
+            id: `transcript-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            role: 'transcript',
+            content: data.transcript,
+            timestamp: data.timestamp,
+            type: 'transcript',
+            source: data.source,
+        };
+        
+        this.transcriptMessages = [...this.transcriptMessages, transcriptMessage];
+        // Don't add to main messages array - keep transcripts separate
+        
+        // Console log computer audio transcripts for visibility
+        console.log('🔊 [Computer Audio] Captured transcript:', data.transcript);
+        console.log('📊 [Computer Audio] Source:', data.source, 'Timestamp:', new Date(data.timestamp).toLocaleTimeString());
+        
+        this.requestUpdate();
+    }
+
     // Header event handlers
     handleCustomizeClick() {
         this.currentView = 'customize';
@@ -305,8 +375,18 @@ export class CheatingDaddyApp extends LitElement {
         this.requestUpdate();
     }
 
+    handleConnectionsClick() {
+        this.currentView = 'connections';
+        this.requestUpdate();
+    }
+
+    handleHomeClick() {
+        this.currentView = 'main';
+        this.requestUpdate();
+    }
+
     async handleClose() {
-        if (this.currentView === 'customize' || this.currentView === 'help' || this.currentView === 'history') {
+        if (this.currentView === 'customize' || this.currentView === 'help' || this.currentView === 'history' || this.currentView === 'advanced' || this.currentView === 'connections') {
             this.currentView = 'main';
         } else if (this.currentView === 'assistant') {
             cheddar.stopCapture();
@@ -402,8 +482,15 @@ export class CheatingDaddyApp extends LitElement {
             role: 'user',
             content: trimmedMessage,
             timestamp: Date.now(),
+            type: 'chat', // Mark as chat message
         };
+        this.chatMessages = [...this.chatMessages, userMessage];
+        // Keep backward compatibility for the UI
         this.messages = [...this.messages, userMessage];
+        
+        // Console log chat messages for visibility
+        console.log('💬 [Chat Message] User typed:', trimmedMessage);
+        console.log('📊 [Chat Message] Sent at:', new Date().toLocaleTimeString());
 
         const result = await window.cheddar.sendTextMessage(trimmedMessage);
 
@@ -512,6 +599,9 @@ export class CheatingDaddyApp extends LitElement {
             case 'advanced':
                 return html` <advanced-view></advanced-view> `;
 
+            case 'connections':
+                return html` <connections-view></connections-view> `;
+
             case 'assistant':
                 return html`
                     <assistant-view
@@ -519,6 +609,8 @@ export class CheatingDaddyApp extends LitElement {
                         .currentResponseIndex=${this.currentResponseIndex}
                         .selectedProfile=${this.selectedProfile}
                         .messages=${this.messages}
+                        .chatMessages=${this.chatMessages}
+                        .transcriptMessages=${this.transcriptMessages}
                         .onSendText=${message => this.handleSendText(message)}
                         .shouldAnimateResponse=${this.shouldAnimateResponse}
                         @response-index-changed=${this.handleResponseIndexChanged}
@@ -553,6 +645,8 @@ export class CheatingDaddyApp extends LitElement {
                         .onHelpClick=${() => this.handleHelpClick()}
                         .onHistoryClick=${() => this.handleHistoryClick()}
                         .onAdvancedClick=${() => this.handleAdvancedClick()}
+                        .onConnectionsClick=${() => this.handleConnectionsClick()}
+                        .onHomeClick=${() => this.handleHomeClick()}
                         .onCloseClick=${() => this.handleClose()}
                         .onBackClick=${() => this.handleBackClick()}
                         .onHideToggleClick=${() => this.handleHideToggle()}

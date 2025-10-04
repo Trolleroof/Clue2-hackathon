@@ -13,7 +13,7 @@ const { saveDebugAudio } = require('../audioUtils');
 const { cartesiaSpeechService } = require('./cartesia');
 const { cerebrasService } = require('./cerebras');
 const { composioService } = require('./composio');
-// Removed prompts dependency
+const { getSystemPrompt } = require('./prompts');
 
 // Audio / transcription configuration
 const DEFAULT_SAMPLE_RATE = 24000;
@@ -27,6 +27,7 @@ let sessionState = {
     googleSearchEnabled: true,
     geminiApiKey: process.env.GEMINI_API_KEY || null,
     active: false,
+    autoResponseEnabled: false, // Default to disabled
 };
 
 // Audio capture variables
@@ -36,6 +37,9 @@ let systemAudioProc = null;
 let lastProcessedTranscript = '';
 const recentTranscripts = new Set();
 let ttsQueue = Promise.resolve();
+
+// Throttling variables
+let lastMicLogTime = 0;
 
 // Google Search state (Gemini used strictly for search tool)
 const searchState = {
@@ -259,7 +263,7 @@ function queueTtsSynthesis(text) {
         });
 }
 
-async function respondWithCerebras(transcript, searchSummary = null) {
+async function respondWithCerebras(transcript, searchSummary = null, options = {}) {
     console.log(`[Cerebras] Starting respondWithCerebras for: "${transcript.substring(0, 50)}..."`);
     
     const history = buildCerebrasHistory();
@@ -284,7 +288,14 @@ async function respondWithCerebras(transcript, searchSummary = null) {
         }
 
         console.log(`[Cerebras] Sending response to renderer: "${reply.substring(0, 100)}..."`);
-        sendToRenderer('update-response', reply);
+        
+        // Send response with source information
+        if (options.source === 'chat') {
+            sendToRenderer('update-response', { reply, source: 'chat' });
+        } else {
+            sendToRenderer('update-response', reply); // Default behavior for backward compatibility
+        }
+        
         saveConversationTurn(transcript, reply);
         queueTtsSynthesis(reply);
         sendToRenderer('update-status', 'Listening...');
@@ -293,6 +304,72 @@ async function respondWithCerebras(transcript, searchSummary = null) {
         console.error('[Cerebras] Error in respondWithCerebras:', error);
         sendToRenderer('update-status', 'Listening...');
     }
+}
+
+function shouldGenerateResponse(transcript, options = {}) {
+    // Always generate response for manual user input
+    if (options.isManual) {
+        return true;
+    }
+    
+    // Check if automatic responses are disabled via session state
+    if (sessionState.autoResponseEnabled === false) {
+        return false;
+    }
+    
+    // Skip trivial single words or very short phrases
+    const words = transcript.split(/\s+/).filter(w => w.length > 0);
+    if (words.length <= 3) {
+        // Skip common trivial phrases
+        const trivialPhrases = [
+            'ok', 'yes', 'no', 'uh', 'um', 'well', 'right', 'alright', 'hello', 'hi',
+            'thank you', 'thanks', 'bye', 'goodbye', 'see you', 'next', 'continue',
+            'ready', 'go', 'start', 'stop', 'pause', 'time', 'minutes', 'seconds',
+            'hour', 'late', 'early', 'good', 'bad', 'fine', 'great', 'excellent'
+        ];
+        
+        const lowercase = transcript.toLowerCase().trim();
+        if (trivialPhrases.includes(lowercase)) {
+            return false;
+        }
+    }
+    
+    // Skip very short content (less than 15 characters)
+    if (transcript.length < 15) {
+        return false;
+    }
+    
+    // Skip audio/video announcements (common in meetings, presentations)
+    const announcementPatterns = [
+        /(\d+)\s*(minute|second)s?\s*on\s*the\s*clock/i,
+        /(mute|unmute|audio|video|screen|share)/i,
+        /(please|let|allow|give|take)\s*(us|me|him|her)\s*(the|a|an)\s*\w+/i,
+        /(this is|that is|we have|they have)\s*(a|an)\s*\w+/i,
+        /recording|record/i,
+    ];
+    
+    for (const pattern of announcementPatterns) {
+        if (pattern.test(transcript)) {
+            return false;
+        }
+    }
+    
+    // Skip simple acknowledgments
+    const acknowledgmentPatterns = [
+        /^(alright|okay|ok|yes|sure|yep|right)\s*,?\s*(let|we|let's)/i,
+        /^(let|we|let's)\s*(go|see|do|try|start|begin)/i,
+        /^(good|great|excellent|perfect|wonderful)\s*,?/i,
+        /^(i|we|you|he|she|they)\s*(think|believe|feel|know)\s*(so|that)/i,
+    ];
+    
+    for (const pattern of acknowledgmentPatterns) {
+        if (pattern.test(transcript.trim())) {
+            return false;
+        }
+    }
+    
+    // Default to generating response for substantial content
+    return true;
 }
 
 async function handleCartesiaTranscript(rawTranscript, options = {}) {
@@ -324,16 +401,31 @@ async function handleCartesiaTranscript(rawTranscript, options = {}) {
     recentTranscripts.add(cleaned);
     lastProcessedTranscript = cleaned;
 
-    console.log(`[Cartesia Transcript] ${cleaned}`);
+    console.log(`🎤 [Audio Processing] Raw transcript captured: "${cleaned}"`);
+    console.log(`📈 [Audio Processing] Length: ${cleaned.length} characters, Quality: ${cleaned.length > 20 ? 'Good' : 'Short'}`);
 
-    // Save transcript and generate AI response automatically
+    // Always save transcript to conversation history (separate from chat messages)
     saveConversationTurn(cleaned, '');
     
-    // Generate AI response using Cerebras
-    try {
-        await respondWithCerebras(cleaned);
-    } catch (error) {
-        console.error('Error generating Cerebras response:', error);
+    // Send transcript to renderer to be stored in transcriptMessages array
+    sendToRenderer('transcript-captured', {
+        transcript: cleaned,
+        timestamp: Date.now(),
+        source: 'audio'
+    });
+    
+    console.log(`📤 [Audio Processing] Transcript forwarded to UI`);
+    
+    // Only generate AI response for significant content that warrants a response
+    if (shouldGenerateResponse(cleaned, options)) {
+        console.log(`[Decision] Generating Cerebras response for: "${cleaned}"`);
+        try {
+            await respondWithCerebras(cleaned);
+        } catch (error) {
+            console.error('Error generating Cerebras response:', error);
+        }
+    } else {
+        console.log(`[Decision] Skipping Cerebras response for: "${cleaned}" (trivial content)`);
     }
 }
 
@@ -360,7 +452,14 @@ async function startMacOSAudioCapture() {
 
     await killExistingSystemAudioDump();
 
-    console.log('Starting macOS audio capture with SystemAudioDump...');
+    console.log('🎤 Starting macOS audio capture with SystemAudioDump...');
+
+    // Define audio constants first
+    const OUTPUT_SAMPLE_RATE = parseInt(process.env.MAC_AUDIO_SAMPLE_RATE || String(DEFAULT_SAMPLE_RATE), 10);
+    const CHANNELS = parseInt(process.env.MAC_AUDIO_CHANNELS || '2', 10);
+    const BYTES_PER_SAMPLE = 2;
+    const CHUNK_DURATION = 0.1;
+    const CHUNK_SIZE = Math.round(OUTPUT_SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS * CHUNK_DURATION);
 
     const { app } = require('electron');
     const path = require('path');
@@ -381,19 +480,20 @@ async function startMacOSAudioCapture() {
         },
     };
 
-    systemAudioProc = spawn(systemAudioPath, [], spawnOptions);
+    const spawnArgs = [];
+
+    console.log(
+        `🎤 [SystemAudioDump] Starting audio capture (${OUTPUT_SAMPLE_RATE}Hz, ${CHANNELS} channel${CHANNELS !== 1 ? 's' : ''})`
+    );
+
+    systemAudioProc = spawn(systemAudioPath, spawnArgs, spawnOptions);
 
     if (!systemAudioProc.pid) {
-        console.error('Failed to start SystemAudioDump');
+        console.error('❌ [SystemAudioDump] Failed to start SystemAudioDump');
         return false;
     }
 
-    console.log('SystemAudioDump started with PID:', systemAudioProc.pid);
-
-    const CHANNELS = 2;
-    const BYTES_PER_SAMPLE = 2;
-    const CHUNK_DURATION = 0.1;
-    const CHUNK_SIZE = DEFAULT_SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS * CHUNK_DURATION;
+    console.log(`✅ [SystemAudioDump] Started with PID: ${systemAudioProc.pid}`);
 
     let audioBuffer = Buffer.alloc(0);
 
@@ -414,7 +514,7 @@ async function startMacOSAudioCapture() {
             // Do not persist audio to disk; keep system lightweight
         }
 
-        const maxBufferSize = DEFAULT_SAMPLE_RATE * BYTES_PER_SAMPLE * 1;
+        const maxBufferSize = OUTPUT_SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS;
         if (audioBuffer.length > maxBufferSize) {
             audioBuffer = audioBuffer.slice(-maxBufferSize);
         }
@@ -443,7 +543,9 @@ function convertStereoToMono(stereoBuffer) {
 
     for (let i = 0; i < samples; i++) {
         const leftSample = stereoBuffer.readInt16LE(i * 4);
-        monoBuffer.writeInt16LE(leftSample, i * 2);
+        const rightSample = stereoBuffer.readInt16LE(i * 4 + 2);
+        const monoSample = Math.max(-32768, Math.min(32767, Math.round((leftSample + rightSample) / 2)));
+        monoBuffer.writeInt16LE(monoSample, i * 2);
     }
 
     return monoBuffer;
@@ -464,6 +566,23 @@ function stopMacOSAudioCapture() {
 }
 
 function setupGeminiIpcHandlers(geminiSessionRef) {
+    // Auto-initialize Composio if API key is available
+    async function autoInitializeComposio() {
+        const composioApiKey = process.env.COMPOSIO_API_KEY;
+        if (composioApiKey && !composioService.isServiceInitialized()) {
+            console.log('Auto-initializing Composio service with environment API key...');
+            const success = await composioService.initialize(composioApiKey, process.env.GEMINI_API_KEY);
+            if (success) {
+                console.log('Composio service auto-initialized successfully');
+            } else {
+                console.warn('Failed to auto-initialize Composio service');
+            }
+        }
+    }
+
+    // Initialize Composio on startup
+    autoInitializeComposio();
+
     ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, composioApiKey = null) => {
         sendToRenderer('session-initializing', true);
 
@@ -475,6 +594,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         };
 
         sessionState.googleSearchEnabled = (await getStoredSetting('googleSearchEnabled', 'true')) === 'true';
+        sessionState.autoResponseEnabled = (await getStoredSetting('autoResponseEnabled', 'false')) === 'true';
 
         initializeNewSession();
 
@@ -484,8 +604,9 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             debounceMs: 1200,
         });
 
+        // Initialize Composio if API key is provided and service is not already initialized
         if (composioApiKey && !composioService.isServiceInitialized()) {
-            console.log('Initializing Composio service...');
+            console.log('Initializing Composio service with provided API key...');
             await composioService.initialize(composioApiKey, sessionState.geminiApiKey);
         }
 
@@ -518,9 +639,26 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
-    ipcMain.handle('send-mic-audio-content', async () => {
-        // Mic channel ignored intentionally to avoid duplicate transcripts
-        return { success: true, skipped: true };
+    ipcMain.handle('send-mic-audio-content', async (event, { data, mimeType }) => {
+        // Throttled microphone logging (once per second)
+        if (data && typeof data === 'string') {
+            const now = Date.now();
+            if (now - lastMicLogTime >= 1000) {
+                console.log(`[Mic Audio Received] ${mimeType || 'audio/pcm'}, Base64 length: ${data.length}`);
+                lastMicLogTime = now;
+            }
+            
+            // Optional: Send to Cartesia for transcription if configured to use mic-only mode
+            if (sessionState.active) {
+                try {
+                    cartesiaSpeechService.enqueueBase64Audio(data);
+                } catch (error) {
+                    console.error('[Mic Audio] Error sending to Cartesia:', error);
+                }
+            }
+        }
+        
+        return { success: true };
     });
 
     ipcMain.handle('send-image-content', async () => {
@@ -536,9 +674,15 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             return { success: false, error: 'Invalid text message' };
         }
 
-        // Treat explicit user text as a transcript line unless user requests a response via generate-ai-response
-        await handleCartesiaTranscript(text, { isManual: true });
-        return { success: true };
+        // For manual chat messages, generate immediate response and mark as chat
+        console.log(`[Chat Message] Processing manual chat: "${text}"`);
+        try {
+            await respondWithCerebras(text, null, { source: 'chat' });
+            return { success: true };
+        } catch (error) {
+            console.error('Error handling chat message:', error);
+            return { success: false, error: error.message };
+        }
     });
 
     // Optional: generate an AI response on-demand when explicitly requested by the renderer.
@@ -606,6 +750,12 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
+    ipcMain.handle('update-auto-response-setting', async (event, enabled) => {
+        sessionState.autoResponseEnabled = enabled;
+        console.log(`[Auto Response] Setting updated: ${enabled ? 'enabled' : 'disabled'}`);
+        return { success: true };
+    });
+
     ipcMain.handle('get-current-session', async () => {
         try {
             return { success: true, data: getCurrentSessionData() };
@@ -643,6 +793,70 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             return { success };
         } catch (error) {
             console.error('Error initializing Composio:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('check-composio-status', async () => {
+        try {
+            const isInitialized = composioService.isServiceInitialized();
+            return { 
+                success: true, 
+                isInitialized,
+                message: isInitialized ? 'Composio service is initialized' : 'Composio service is not initialized'
+            };
+        } catch (error) {
+            console.error('Error checking Composio status:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('get-composio-connectors', async () => {
+        try {
+            const connectors = composioService.getAvailableConnectors();
+            return { success: true, connectors };
+        } catch (error) {
+            console.error('Error fetching Composio connectors:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('connect-composio-connector', async (event, externalUserId, connectorKey, options = {}) => {
+        try {
+            const result = await composioService.connectConnector(externalUserId, connectorKey, options);
+            return result;
+        } catch (error) {
+            console.error('Error connecting Composio connector:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('wait-composio-connection', async (event, externalUserId, connectorKey) => {
+        try {
+            const result = await composioService.waitForConnectorConnection(externalUserId, connectorKey);
+            return result;
+        } catch (error) {
+            console.error('Error waiting for Composio connection:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('get-composio-connector-status', async (event, externalUserId, connectorKey) => {
+        try {
+            const result = await composioService.getConnectorStatus(externalUserId, connectorKey);
+            return result;
+        } catch (error) {
+            console.error('Error getting Composio connector status:', error);
+            return { success: false, error: error.message };
+        }
+    });
+
+    ipcMain.handle('disconnect-composio-connector', async (event, externalUserId, connectorKey) => {
+        try {
+            const result = await composioService.disconnectConnector(externalUserId, connectorKey);
+            return result;
+        } catch (error) {
+            console.error('Error disconnecting Composio connector:', error);
             return { success: false, error: error.message };
         }
     });

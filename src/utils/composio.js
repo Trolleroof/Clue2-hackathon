@@ -1,17 +1,117 @@
 /**
- * Composio service for Gmail integration using Google/Gemini provider
- * Handles authentication and connection management
+ * Composio service for managing third-party connectors via the Composio API.
+ * Handles authentication, connection workflows, and basic status tracking.
  */
 
 // Load environment variables
 require('dotenv').config();
 
+const CONNECTORS = [
+    {
+        key: 'linear',
+        displayName: 'Linear',
+        authConfigId: 'ac_C5mpd5r37bH4',
+        logoUrl: 'https://logos.composio.dev/api/linear',
+        authType: 'OAUTH2'
+    },
+    {
+        key: 'googleDocs',
+        displayName: 'Google Docs',
+        authConfigId: 'ac_SMDf4M_jKYE1',
+        logoUrl: 'https://logos.composio.dev/api/googledocs',
+        authType: 'OAUTH2'
+    },
+    {
+        key: 'twitter',
+        displayName: 'Twitter',
+        authConfigId: 'ac_pTUxOmkyKFHJ',
+        logoUrl: 'https://logos.composio.dev/api/twitter',
+        authType: 'OAUTH2'
+    },
+    {
+        key: 'googleSheets',
+        displayName: 'Google Sheets',
+        authConfigId: 'ac__DPVy8XWTDGX',
+        logoUrl: 'https://logos.composio.dev/api/googlesheets',
+        authType: 'OAUTH2'
+    },
+    {
+        key: 'googleSlides',
+        displayName: 'Google Slides',
+        authConfigId: 'ac_b9UhoJR0WgT3',
+        logoUrl: 'https://cdn.jsdelivr.net/gh/ComposioHQ/open-logos@master/google-slides.svg',
+        authType: 'OAUTH2'
+    },
+    {
+        key: 'github',
+        displayName: 'GitHub',
+        authConfigId: 'ac_b7RFgtr7s1Uf',
+        logoUrl: 'https://logos.composio.dev/api/github',
+        authType: 'OAUTH2'
+    },
+    {
+        key: 'googleDrive',
+        displayName: 'Google Drive',
+        authConfigId: 'ac_0yXGuyFmAacK',
+        logoUrl: 'https://logos.composio.dev/api/googledrive',
+        authType: 'OAUTH2'
+    },
+    {
+        key: 'linkedin',
+        displayName: 'LinkedIn',
+        authConfigId: 'ac_9NVcBfIIjuMU',
+        logoUrl: 'https://logos.composio.dev/api/linkedin',
+        authType: 'OAUTH2'
+    },
+    {
+        key: 'slack',
+        displayName: 'Slack',
+        authConfigId: 'ac_ohDLI9rewHgG',
+        logoUrl: 'https://logos.composio.dev/api/slack',
+        authType: 'OAUTH2'
+    },
+    {
+        key: 'gmail',
+        displayName: 'Gmail',
+        authConfigId: 'ac_AEOPhhO57Zsk',
+        logoUrl: 'https://logos.composio.dev/api/gmail',
+        authType: 'OAUTH2'
+    }
+];
+
+const CONNECTOR_LOOKUP = new Map(CONNECTORS.map(connector => [connector.key, connector]));
+const CONNECTOR_BY_AUTH_ID = new Map(CONNECTORS.map(connector => [connector.authConfigId, connector]));
+
 class ComposioService {
     constructor() {
         this.composio = null;
-        this.connectedAccounts = new Map(); // Store connected accounts by externalUserId
+        this.connectionSessions = new Map(); // Store connection attempts keyed by user+connector
         this.isInitialized = false;
         this.geminiClient = null;
+    }
+
+    _getSessionKey(externalUserId, connectorKey) {
+        return `${externalUserId}::${connectorKey}`;
+    }
+
+    _resolveConnector(connectorKey, authConfigIdOverride = null) {
+        if (connectorKey && CONNECTOR_LOOKUP.has(connectorKey)) {
+            return CONNECTOR_LOOKUP.get(connectorKey);
+        }
+        if (authConfigIdOverride && CONNECTOR_BY_AUTH_ID.has(authConfigIdOverride)) {
+            return CONNECTOR_BY_AUTH_ID.get(authConfigIdOverride);
+        }
+        throw new Error(`Unknown Composio connector: ${connectorKey || authConfigIdOverride}`);
+    }
+
+    getAvailableConnectors() {
+        return CONNECTORS.map(({ key, displayName, authConfigId, logoUrl, authType }) => ({
+            key,
+            displayName,
+            authConfigId,
+            logoUrl,
+            authType
+        }));
     }
 
     /**
@@ -39,6 +139,7 @@ class ComposioService {
             });
             
             this.isInitialized = true;
+            this.connectionSessions.clear();
             console.log('Composio service initialized successfully with Google provider');
             return true;
         } catch (error) {
@@ -53,58 +154,64 @@ class ComposioService {
      * @param {string} authConfigId - Gmail auth config ID
      * @returns {Promise<{success: boolean, redirectUrl?: string, error?: string}>}
      */
-    async connectGmail(externalUserId, authConfigId = 'ac_AEOPhhO57Zsk') {
+    async connectConnector(externalUserId, connectorKey, options = {}) {
         if (!this.isInitialized) {
             return { success: false, error: 'Composio service not initialized' };
         }
 
         try {
-            console.log(`Starting Gmail connection for user: ${externalUserId}`);
-            
+            const connector = this._resolveConnector(connectorKey, options.authConfigId);
+            console.log(`Starting ${connector.displayName} connection for user: ${externalUserId}`);
+
             const connectionRequest = await this.composio.connectedAccounts.link(
                 externalUserId,
-                authConfigId
+                options.authConfigId || connector.authConfigId,
+                options.linkOptions
             );
 
-            // Store the connection request for later polling
-            this.connectedAccounts.set(externalUserId, {
+            const key = this._getSessionKey(externalUserId, connector.key);
+            this.connectionSessions.set(key, {
                 request: connectionRequest,
                 status: 'pending',
-                connectedAccount: null
+                connectedAccount: null,
+                connector
             });
 
             return {
                 success: true,
+                connector: connector.key,
                 redirectUrl: connectionRequest.redirectUrl
             };
         } catch (error) {
-            console.error('Failed to start Gmail connection:', error);
+            console.error(`Failed to start ${connectorKey} connection:`, error);
             return { success: false, error: error.message };
         }
     }
 
     /**
-     * Wait for Gmail connection to be established
+     * Wait for a connector connection to be established
      * @param {string} externalUserId - User identifier
+     * @param {string} connectorKey - Connector identifier
      * @param {number} timeoutMs - Timeout in milliseconds (default: 300000 = 5 minutes)
      * @returns {Promise<{success: boolean, connectedAccount?: object, error?: string}>}
      */
-    async waitForGmailConnection(externalUserId, timeoutMs = 300000) {
-        const userConnection = this.connectedAccounts.get(externalUserId);
+    async waitForConnectorConnection(externalUserId, connectorKey, timeoutMs = 300000) {
+        const sessionKey = this._getSessionKey(externalUserId, connectorKey);
+        const userConnection = this.connectionSessions.get(sessionKey);
         if (!userConnection) {
-            return { success: false, error: 'No connection request found for user' };
+            return { success: false, error: 'No connection request found for user and connector' };
         }
 
         try {
-            console.log(`Waiting for Gmail connection for user: ${externalUserId}`);
+            console.log(`Waiting for ${userConnection.connector.displayName} connection for user: ${externalUserId}`);
             
-            const connectedAccount = await userConnection.request.waitForConnection();
+            const connectedAccount = await userConnection.request.waitForConnection(timeoutMs);
             
             // Update stored connection info
             userConnection.status = 'connected';
             userConnection.connectedAccount = connectedAccount;
 
-            console.log(`Gmail connection established for user: ${externalUserId}, account ID: ${connectedAccount.id}`);
+            console.log(`${userConnection.connector.displayName} connection established for user: ${externalUserId}, account ID: ${connectedAccount.id}`);
             
             return {
                 success: true,
@@ -116,64 +223,97 @@ class ComposioService {
                 }
             };
         } catch (error) {
-            console.error('Failed to establish Gmail connection:', error);
+            console.error(`Failed to establish ${userConnection.connector.displayName} connection:`, error);
             userConnection.status = 'failed';
             return { success: false, error: error.message };
         }
     }
 
     /**
-     * Get connection status for a user
+     * Get connection status for a user and connector
      * @param {string} externalUserId - User identifier
+     * @param {string} connectorKey - Connector identifier
      * @returns {Promise<{success: boolean, status?: string, connectedAccount?: object, error?: string}>}
      */
-    async getGmailConnectionStatus(externalUserId) {
-        const userConnection = this.connectedAccounts.get(externalUserId);
-        if (!userConnection) {
-            // Check if we have a real connection through Composio
-            try {
-                const tools = await this.composio.tools.get(externalUserId, {
-                    tools: ["GMAIL_SEND_EMAIL"],
-                });
-                if (tools && tools.length > 0) {
-                    return { 
-                        success: true, 
-                        status: 'connected',
-                        connectedAccount: { id: 'real-composio-connection' }
-                    };
-                }
-            } catch (error) {
-                console.log('No real Gmail connection found:', error.message);
-            }
-            return { success: false, error: 'No Gmail connection found. Please connect Gmail in Composio dashboard.' };
+    async getConnectorStatus(externalUserId, connectorKey) {
+        if (!this.isInitialized) {
+            return { success: false, error: 'Composio service not initialized' };
         }
 
-        return {
-            success: true,
-            status: userConnection.status,
-            connectedAccount: userConnection.connectedAccount
-        };
+        const connector = this._resolveConnector(connectorKey);
+        const sessionKey = this._getSessionKey(externalUserId, connector.key);
+        const userConnection = this.connectionSessions.get(sessionKey);
+
+        try {
+            const listResponse = await this.composio.connectedAccounts.list({
+                userIds: [externalUserId],
+                authConfigIds: [connector.authConfigId],
+            });
+
+            const items = Array.isArray(listResponse?.items) ? listResponse.items : [];
+            const activeAccount = items.find(item => item.status === 'ACTIVE');
+            const account = activeAccount || items[0];
+
+            if (account) {
+                const normalizedStatus = account.status === 'ACTIVE' ? 'connected' : account.status?.toLowerCase?.() || 'unknown';
+                const connectedAccountInfo = {
+                    id: account.id,
+                    status: account.status,
+                    statusReason: account.statusReason || null,
+                    updatedAt: account.updatedAt || null,
+                    createdAt: account.createdAt || null,
+                    connector: connector.key,
+                };
+
+                this.connectionSessions.set(sessionKey, {
+                    request: userConnection?.request || null,
+                    status: normalizedStatus,
+                    connectedAccount: connectedAccountInfo,
+                    connector,
+                });
+
+                return {
+                    success: true,
+                    status: normalizedStatus,
+                    connectedAccount: connectedAccountInfo,
+                };
+            }
+        } catch (error) {
+            console.error(`Failed to query ${connector.displayName} connection status:`, error);
+        }
+
+        if (userConnection) {
+            return {
+                success: true,
+                status: userConnection.status,
+                connectedAccount: userConnection.connectedAccount,
+            };
+        }
+
+        return { success: false, error: `No ${connector.displayName} connection found. Please connect via Composio.` };
     }
 
     /**
-     * Disconnect Gmail for a user
+     * Disconnect a connector for a user (local cache only)
      * @param {string} externalUserId - User identifier
+     * @param {string} connectorKey - Connector identifier
      * @returns {Promise<{success: boolean, error?: string}>}
      */
-    async disconnectGmail(externalUserId) {
-        const userConnection = this.connectedAccounts.get(externalUserId);
+    async disconnectConnector(externalUserId, connectorKey) {
+        const sessionKey = this._getSessionKey(externalUserId, connectorKey);
+        const userConnection = this.connectionSessions.get(sessionKey);
         if (!userConnection) {
             return { success: false, error: 'No connection found for user' };
         }
 
         try {
             // Remove from local storage
-            this.connectedAccounts.delete(externalUserId);
-            console.log(`Gmail disconnected for user: ${externalUserId}`);
+            this.connectionSessions.delete(sessionKey);
+            console.log(`${userConnection.connector.displayName} disconnected (local cache cleared) for user: ${externalUserId}`);
             
             return { success: true };
         } catch (error) {
-            console.error('Failed to disconnect Gmail:', error);
+            console.error(`Failed to disconnect ${userConnection.connector.displayName}:`, error);
             return { success: false, error: error.message };
         }
     }
@@ -184,14 +324,33 @@ class ComposioService {
      */
     getConnectedAccounts() {
         const accounts = [];
-        for (const [externalUserId, connection] of this.connectedAccounts.entries()) {
+        for (const [sessionKey, connection] of this.connectionSessions.entries()) {
+            const [externalUserId, connectorKey] = sessionKey.split('::');
             accounts.push({
                 externalUserId,
+                connectorKey,
                 status: connection.status,
                 connectedAccount: connection.connectedAccount
             });
         }
         return accounts;
+    }
+
+    // Legacy Gmail-specific wrappers maintained for backwards compatibility
+    async connectGmail(externalUserId, authConfigId = 'ac_AEOPhhO57Zsk') {
+        return this.connectConnector(externalUserId, 'gmail', { authConfigId });
+    }
+
+    async waitForGmailConnection(externalUserId, timeoutMs = 300000) {
+        return this.waitForConnectorConnection(externalUserId, 'gmail', timeoutMs);
+    }
+
+    async getGmailConnectionStatus(externalUserId) {
+        return this.getConnectorStatus(externalUserId, 'gmail');
+    }
+
+    async disconnectGmail(externalUserId) {
+        return this.disconnectConnector(externalUserId, 'gmail');
     }
 
     /**
@@ -380,5 +539,6 @@ const composioService = new ComposioService();
 
 module.exports = {
     ComposioService,
-    composioService
+    composioService,
+    CONNECTORS
 };
